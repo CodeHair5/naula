@@ -5,14 +5,15 @@ import { resolvePlating } from './chemistryRules.js';
 // Copper color (slightly brighter to read from distance)
 const COPPER_COLOR = 0xcd7f32;
 
-export function setupNaulaController({ renderer, camera, controls, nail, constants, onNailMoveInside, onNailMove, enablePlating = true, onAttached, onPlatingUnlocked } = {}) {
+export function setupNaulaController({ renderer, camera, controls, nail, constants, tubeGroups = [], onNailMoveInside, onNailMove, enablePlating = true, onAttached, onPlatingUnlocked } = {}) {
   const { TUBE_RADIUS, TUBE_HEIGHT, LIQUID_LEVEL } = constants;
 
   // Prepare nail state
   nail.geometry.computeBoundingBox();
   const bbox = nail.geometry.boundingBox;
   const NAIL_TIP_OFFSET = -bbox.min.y; // tip distance below origin
-  const TUBE_INNER_RADIUS = TUBE_RADIUS - 0.02;
+  const NAIL_COLLISION_RADIUS = Math.max(Math.abs(bbox.min.x), Math.abs(bbox.max.x));
+  const TUBE_INNER_RADIUS = TUBE_RADIUS - 0.05;
 
   // Base material patch only when plating visuals are enabled (prevents hiding base when no overlay)
   const steelUniformAccessor = enablePlating ? patchBaseMaterialForPlating(nail) : null;
@@ -53,20 +54,23 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
     plateType = 'none';
   }
 
-  // Drag handling (simple model: lock to center when inside; enter only from above)
+  // Drag in the XY plane; tube walls block horizontal crossings.
   const raycaster = new THREE.Raycaster();
   const mouse = new THREE.Vector2();
   const dragPlane = new THREE.Plane();
   const dragPoint = new THREE.Vector3();
+  const dragOffset = new THREE.Vector3();
   let dragging = false;
+  let dragMoved = false;
   nail.userData.isInTube = false;
   let lastInsidePos = new THREE.Vector3().copy(nail.position);
   let lastAnyPos = new THREE.Vector3().copy(nail.position);
   let lastTipY = nail.position.y - NAIL_TIP_OFFSET;
   let attachedTube = null; // the group of the tube this nail is attached to
+  let alignedTube = null;
   // (No time-based plating logic)
 
-  // Simple drop physics inside tube when mouse released
+  // Gravity continues after release, and tube openings determine which tube catches the nail.
   let isDropping = false;
   let velY = 0; // downward velocity (>0 means moving down)
   const GRAVITY = 9.8; // m/s^2-ish units in scene scale
@@ -104,107 +108,228 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
     return raycaster.ray.intersectPlane(dragPlane, dragPoint);
   }
 
+  function findTubeAtPosition(position) {
+    const nailBottom = position.y + bbox.min.y;
+    const nailTop = position.y + bbox.max.y;
+    if (nailBottom >= TUBE_HEIGHT || nailTop <= 0) return null;
+    const openingRadius = TUBE_INNER_RADIUS - NAIL_COLLISION_RADIUS;
+    return tubeGroups.find((tube) =>
+      Math.hypot(position.x - tube.position.x, position.z - tube.position.z) <= openingRadius
+    ) || null;
+  }
+
+  function findTubeForEntry(from, target) {
+    const fromTip = from.y + bbox.min.y;
+    const targetTip = target.y + bbox.min.y;
+    if (fromTip <= TUBE_HEIGHT || targetTip > TUBE_HEIGHT || target.y >= from.y) return null;
+
+    return tubeGroups.find((tube) =>
+      Math.hypot(target.x - tube.position.x, target.z - tube.position.z) <=
+        TUBE_RADIUS + NAIL_COLLISION_RADIUS
+    ) || null;
+  }
+
+  function findTubeAtWallHeight(position) {
+    const nailBottom = position.y + bbox.min.y;
+    const nailTop = position.y + bbox.max.y;
+    if (nailBottom >= TUBE_HEIGHT || nailTop <= TUBE_RADIUS) return null;
+
+    return tubeGroups.find((tube) =>
+      Math.hypot(position.x - tube.position.x, position.z - tube.position.z) <=
+        TUBE_RADIUS + NAIL_COLLISION_RADIUS
+    ) || null;
+  }
+
+  function crossesTubeWall(from, to) {
+    if (from.x === to.x && from.z === to.z && to.y > from.y) return false;
+
+    const minY = Math.min(from.y, to.y);
+    const maxY = Math.max(from.y, to.y);
+    if (maxY + bbox.max.y <= TUBE_RADIUS || minY + bbox.min.y >= TUBE_HEIGHT) return false;
+
+    return tubeGroups.some((tube) => {
+      const startX = from.x - tube.position.x;
+      const startZ = from.z - tube.position.z;
+      const endX = to.x - tube.position.x;
+      const endZ = to.z - tube.position.z;
+      const segmentX = endX - startX;
+      const segmentZ = endZ - startZ;
+      const lengthSquared = segmentX * segmentX + segmentZ * segmentZ;
+      const projection = lengthSquared === 0
+        ? 0
+        : THREE.MathUtils.clamp(-(startX * segmentX + startZ * segmentZ) / lengthSquared, 0, 1);
+      const closestX = startX + projection * segmentX;
+      const closestZ = startZ + projection * segmentZ;
+      const minDistance = Math.hypot(closestX, closestZ);
+      const maxDistance = Math.max(Math.hypot(startX, startZ), Math.hypot(endX, endZ));
+      const innerWallLimit = Math.max(0, TUBE_INNER_RADIUS - NAIL_COLLISION_RADIUS);
+      const outerWallLimit = TUBE_RADIUS + NAIL_COLLISION_RADIUS;
+      return minDistance <= outerWallLimit && maxDistance >= innerWallLimit;
+    });
+  }
+
+  function constrainToTubeWalls(from, target) {
+    if (!crossesTubeWall(from, target)) return target;
+    let safe = 0;
+    let blocked = 1;
+    for (let i = 0; i < 18; i++) {
+      const middle = (safe + blocked) / 2;
+      const candidate = from.clone().lerp(target, middle);
+      if (crossesTubeWall(from, candidate)) {
+        blocked = middle;
+      } else {
+        safe = middle;
+      }
+    }
+    const distance = from.distanceTo(target);
+    return from.clone().lerp(target, Math.max(0, safe - (distance ? 0.001 / distance : 0)));
+  }
+
+  function updateTubeAttachment() {
+    if (attachedTube && nail.position.y + bbox.min.y > TUBE_HEIGHT) {
+      attachedTube = null;
+      nail.userData.isInTube = false;
+      plannedReaction = null;
+    }
+    if (!attachedTube) {
+      const tube = findTubeAtPosition(nail.position);
+      if (tube) attachToTube(tube, true);
+    }
+  }
+
+  function triggerRipple(tube, strength) {
+    const uniforms = tube && tube.userData && tube.userData.waterUniforms;
+    if (!uniforms) return;
+    const localPos = nail.position.clone().sub(tube.position);
+    const maxOffset = TUBE_INNER_RADIUS * 0.85;
+    const offset = Math.hypot(localPos.x, localPos.z);
+    if (offset > maxOffset) {
+      localPos.x *= maxOffset / offset;
+      localPos.z *= maxOffset / offset;
+    }
+    uniforms.uDropTime.value = (typeof window.__waterElapsed === 'number') ? window.__waterElapsed : 0;
+    uniforms.uDropCenter.value.set(localPos.x, localPos.z);
+    uniforms.uDropStrength.value = Math.max(uniforms.uDropStrength.value, strength);
+  }
+
   function onMouseDown(e) {
-    if (completed) return;
+    if (completed || e.button !== 0 || e.target !== renderer.domElement) return;
     mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
     mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
     const hit = raycaster.intersectObject(nail, false);
     if (hit.length) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
       dragging = true;
+      dragMoved = false;
       controls.enabled = false;
       // cancel any ongoing drop when user grabs the nail
       isDropping = false;
       velY = 0;
       dragPlane.setFromNormalAndCoplanarPoint(
-        camera.getWorldDirection(new THREE.Vector3()),
+        new THREE.Vector3(0, 0, 1),
         nail.position
       );
+      if (screenToPlanePoint(e)) {
+        dragOffset.subVectors(nail.position, dragPoint);
+      }
     }
   }
 
   function onMouseMove(e) {
-  if (completed) return;
-  if (!dragging) return;
-  if (!attachedTube) return; // only draggable when attached to a tube per new UX
+    if (completed || !dragging) return;
     if (!screenToPlanePoint(e)) return;
 
-  let targetX = dragPoint.x;
-  let targetY = dragPoint.y;
-  let targetZ = dragPoint.z;
-
-    // Prevent tip going below bottom (y=0)
-    targetY = Math.max(targetY, NAIL_TIP_OFFSET);
-
-    // Always locked to tube center in XZ while attached
-    targetX = attachedTube.position.x;
-    targetZ = attachedTube.position.z;
-      // Immediate plating growth to max immersion depth (persistent), when active and overlay exists
-      if (enablePlating && plateOverlay) {
-        // Do not modify plated height here; it is frozen after unlock and set exactly at unlock moment
-        // Opacity is 1 only after plating is unlocked (i.e., after full color change)
-        const opacity = platingUnlocked ? 1.0 : 0.0;
-        updateOverlayUniform(plateOverlay, nail.userData.plateLocalY, opacity);
-        updateSteelUniform(steelUniformAccessor, nail.userData.plateLocalY, opacity);
+    const pointerTargetX = dragPoint.x + dragOffset.x;
+    if (
+      alignedTube &&
+      Math.abs(pointerTargetX - alignedTube.position.x) > TUBE_INNER_RADIUS
+    ) {
+      alignedTube = null;
+    }
+    const partialTube = attachedTube || findTubeAtWallHeight(nail.position);
+    const requestedTarget = new THREE.Vector3(
+      attachedTube
+        ? attachedTube.position.x
+        : partialTube
+          ? nail.position.x
+          : alignedTube
+            ? alignedTube.position.x
+            : pointerTargetX,
+      Math.max(dragPoint.y + dragOffset.y, NAIL_TIP_OFFSET),
+      nail.position.z
+    );
+    const entryTube = partialTube || alignedTube
+      ? null
+      : findTubeForEntry(nail.position, requestedTarget);
+    if (entryTube) {
+      const entryOffset = Math.hypot(
+        requestedTarget.x - entryTube.position.x,
+        requestedTarget.z - entryTube.position.z
+      );
+      if (entryOffset <= TUBE_INNER_RADIUS) {
+        alignedTube = entryTube;
+        requestedTarget.x = entryTube.position.x;
       }
+      requestedTarget.y = Math.max(
+        requestedTarget.y,
+        TUBE_HEIGHT - bbox.min.y + 0.01
+      );
+    }
+    const target = constrainToTubeWalls(nail.position, requestedTarget);
+    if (target.distanceToSquared(nail.position) > 1e-6) dragMoved = true;
+    nail.position.copy(target);
+    updateTubeAttachment();
+    if (attachedTube || alignedTube || partialTube) {
+      dragOffset.x = nail.position.x - dragPoint.x;
+    }
+    if (attachedTube) alignedTube = null;
 
-      // Ilmoita liikkeestä putken sisällä (aaltoilun potkaisu)
-      const curr = new THREE.Vector3(targetX, targetY, targetZ);
-      const speed = curr.distanceTo(lastInsidePos);
+    if (enablePlating && plateOverlay) {
+      const opacity = platingUnlocked ? 1.0 : 0.0;
+      updateOverlayUniform(plateOverlay, nail.userData.plateLocalY, opacity);
+      updateSteelUniform(steelUniformAccessor, nail.userData.plateLocalY, opacity);
+    }
 
-      // Lasketaan kärjen korkeus ja rajataan triggereitä vain veden lähellä/sisällä
-      const currTipY = targetY - NAIL_TIP_OFFSET;
-      const SURFACE_BAND = 0.02; // pieni kaista meniskin/toleranssin vuoksi
-      const wasAboveBand = lastTipY > (LIQUID_LEVEL + SURFACE_BAND);
-      const inWaterBand = currTipY <= (LIQUID_LEVEL + SURFACE_BAND);
+    const curr = nail.position.clone();
+    const speed = curr.distanceTo(lastInsidePos);
+    const currTipY = curr.y - NAIL_TIP_OFFSET;
+    const SURFACE_BAND = 0.02;
+    const wasAboveBand = lastTipY > (LIQUID_LEVEL + SURFACE_BAND);
+    const inWaterBand = currTipY <= (LIQUID_LEVEL + SURFACE_BAND);
 
-      // 1) Ensimmäinen kosketus veden pintaan (ylittää kaistan ylhäältä -> alas)
-      const justTouched = wasAboveBand && inWaterBand;
-      if (onNailMoveInside && justTouched) {
-        const touchSpeed = Math.max(0.02, Math.abs(currTipY - lastTipY));
-        onNailMoveInside(touchSpeed);
-      }
-      // Start solution reaction only upon first touch if a reaction is planned
-      if (justTouched && plannedReaction && attachedTube && attachedTube.userData) {
-        const react = attachedTube.userData.reaction || { active: false };
-        const mats = attachedTube.userData.liquidMaterials || [];
-        react.active = true;
-        react.progress = 0;
-        react.start = (mats[0] && mats[0].color) ? mats[0].color.clone() : (attachedTube.userData.baseColor ? attachedTube.userData.baseColor.clone() : new THREE.Color(0xffffff));
-        react.target = new THREE.Color(plannedReaction.color);
-        react.speed = plannedReaction.speed;
-        attachedTube.userData.reaction = react;
-        plannedReaction = null;
-      }
-      // Internal ripple trigger when attached tube has water uniforms
-      if (attachedTube && attachedTube.userData && attachedTube.userData.waterUniforms && (justTouched || (inWaterBand && speed > 0.0006))) {
-        const uniforms = attachedTube.userData.waterUniforms;
-        const localPos = nail.position.clone().sub(attachedTube.position);
-        const u = (localPos.x / (TUBE_INNER_RADIUS)) * 0.5 + 0.5;
-        const v = (localPos.z / (TUBE_INNER_RADIUS)) * 0.5 + 0.5;
-        uniforms.uDropTime.value = (typeof window.__waterElapsed === 'number') ? window.__waterElapsed : 0;
-        uniforms.uDropCenter.value.set(Math.max(0.1, Math.min(0.9, u)), Math.max(0.1, Math.min(0.9, v)));
-        const strength = Math.min(0.7, 0.3 + speed * 3.0);
-        uniforms.uDropStrength.value = Math.max(uniforms.uDropStrength.value, strength);
-      }
+    const justTouched = wasAboveBand && inWaterBand;
+    if (onNailMoveInside && justTouched) {
+      onNailMoveInside(Math.max(0.02, Math.abs(currTipY - lastTipY)));
+    }
+    if (justTouched && plannedReaction && attachedTube && attachedTube.userData) {
+      const react = attachedTube.userData.reaction || { active: false };
+      const mats = attachedTube.userData.liquidMaterials || [];
+      react.active = true;
+      react.progress = 0;
+      react.start = (mats[0] && mats[0].color) ? mats[0].color.clone() : (attachedTube.userData.baseColor ? attachedTube.userData.baseColor.clone() : new THREE.Color(0xffffff));
+      react.target = new THREE.Color(plannedReaction.color);
+      react.speed = plannedReaction.speed;
+      attachedTube.userData.reaction = react;
+      plannedReaction = null;
+    }
+    if (attachedTube && (justTouched || (inWaterBand && speed > 0.0006))) {
+      triggerRipple(attachedTube, Math.min(0.7, 0.3 + speed * 3.0));
+    }
 
-      // 2) Jatkuva liike vain veden kaistalla/sisällä -> jatkuvat riplet heti liikkeestä
-      if (onNailMoveInside && inWaterBand && speed > 0.0006) {
-        onNailMoveInside(speed);
-      }
+    if (onNailMoveInside && inWaterBand && speed > 0.0006) {
+      onNailMoveInside(speed);
+    }
 
     lastTipY = currTipY;
     lastInsidePos.copy(curr);
 
-    // Notify generic movement ripple regardless of being inside/outside
-    const currAny = new THREE.Vector3(targetX, targetY, targetZ);
-    const anySpeed = currAny.distanceTo(lastAnyPos);
+    const anySpeed = curr.distanceTo(lastAnyPos);
     if (onNailMove && anySpeed > 0.0015) {
       onNailMove(anySpeed);
     }
-    lastAnyPos.copy(currAny);
-
-    nail.position.set(targetX, targetY, targetZ);
+    lastAnyPos.copy(curr);
   }
 
   function onMouseUp() {
@@ -212,28 +337,22 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
     if (!dragging) return;
     dragging = false;
     controls.enabled = true;
-    if (attachedTube) {
-      // if the tip is at/under surface, start dropping; otherwise stay put (still attached)
-      const SURFACE_BAND = 0.02;
-      const tipY = nail.position.y - NAIL_TIP_OFFSET;
-      if (tipY <= (LIQUID_LEVEL + SURFACE_BAND)) {
-        isDropping = true;
-        velY = 0;
-      } else {
-        isDropping = false;
-        velY = 0;
-      }
+    if (dragMoved) {
+      isDropping = true;
+      velY = 0;
     }
   }
 
-  renderer.domElement.addEventListener('mousedown', onMouseDown);
-  renderer.domElement.addEventListener('mousemove', onMouseMove);
-  renderer.domElement.addEventListener('mouseup', onMouseUp);
+  window.addEventListener('pointerdown', onMouseDown, true);
+  window.addEventListener('pointermove', onMouseMove);
+  window.addEventListener('pointerup', onMouseUp);
+  window.addEventListener('pointercancel', onMouseUp);
 
   function dispose() {
-    renderer.domElement.removeEventListener('mousedown', onMouseDown);
-    renderer.domElement.removeEventListener('mousemove', onMouseMove);
-    renderer.domElement.removeEventListener('mouseup', onMouseUp);
+    window.removeEventListener('pointerdown', onMouseDown, true);
+    window.removeEventListener('pointermove', onMouseMove);
+    window.removeEventListener('pointerup', onMouseUp);
+    window.removeEventListener('pointercancel', onMouseUp);
   }
 
   // (Removed per-frame time-based plating update)
@@ -245,6 +364,7 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
   updateSteelUniform(steelUniformAccessor, nail.userData.plateLocalY);
     nail.userData.isInTube = false;
     attachedTube = null;
+    alignedTube = null;
     isDropping = false;
     velY = 0;
   platingUnlocked = false;
@@ -252,6 +372,7 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
   completed = false;
   nail.userData.completed = false;
     dragging = false;
+  dragMoved = false;
     controls.enabled = true;
     if (startPosition) {
       nail.position.copy(startPosition);
@@ -261,18 +382,21 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
     lastTipY = nail.position.y - NAIL_TIP_OFFSET;
   }
 
-  function attachToTube(tubeGroup) {
+  function attachToTube(tubeGroup, preservePosition = false) {
     attachedTube = tubeGroup;
-    nail.userData.isInTube = true; // treat as attached/locked
-    // place well above rim so tip is not touching liquid before user drags
-    // ensure tipY = (y - NAIL_TIP_OFFSET) > TUBE_HEIGHT
-    const yAboveRim = TUBE_HEIGHT + NAIL_TIP_OFFSET + 0.2;
-    nail.position.set(tubeGroup.position.x, yAboveRim, tubeGroup.position.z);
+    alignedTube = null;
+    nail.userData.isInTube = true;
+    if (!preservePosition) {
+      const yAboveRim = TUBE_HEIGHT + NAIL_TIP_OFFSET + 0.2;
+      nail.position.set(tubeGroup.position.x, yAboveRim, tubeGroup.position.z);
+      lastTipY = nail.position.y - NAIL_TIP_OFFSET;
+      isDropping = false;
+      velY = 0;
+    } else {
+      nail.position.x = tubeGroup.position.x;
+    }
     lastInsidePos.copy(nail.position);
     lastAnyPos.copy(nail.position);
-    lastTipY = nail.position.y - NAIL_TIP_OFFSET;
-  isDropping = false;
-  velY = 0;
 
     // Decide plating type based on solution and nail type
     const solution = (tubeGroup.userData && tubeGroup.userData.solution) || 'unknown';
@@ -309,6 +433,37 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
 
   // Advance solution color reaction while immersed and handle drop physics + plating while dropping
   function tick(now, dt) {
+    const delta = Math.max(0, dt);
+    if (isDropping) {
+      const previousTipY = nail.position.y - NAIL_TIP_OFFSET;
+      const from = nail.position.clone();
+      const to = nail.position.clone();
+      velY += GRAVITY * delta;
+      to.y = Math.max(NAIL_TIP_OFFSET, nail.position.y - velY * delta);
+      if (crossesTubeWall(from, to)) {
+        nail.position.y = Math.max(nail.position.y, TUBE_HEIGHT + NAIL_TIP_OFFSET);
+        isDropping = false;
+        velY = 0;
+      } else {
+        nail.position.y = to.y;
+      }
+      updateTubeAttachment();
+
+      const tipY = nail.position.y - NAIL_TIP_OFFSET;
+      const surfaceBand = 0.02;
+      if (attachedTube && previousTipY > LIQUID_LEVEL + surfaceBand && tipY <= LIQUID_LEVEL + surfaceBand) {
+        triggerRipple(attachedTube, Math.min(1.7, 0.3 + velY * 0.2));
+      }
+      if (Math.abs(nail.position.y - NAIL_TIP_OFFSET) < 1e-4) {
+        nail.position.y = NAIL_TIP_OFFSET;
+        isDropping = false;
+        velY = 0;
+      }
+      lastInsidePos.copy(nail.position);
+      lastAnyPos.copy(nail.position);
+      lastTipY = nail.position.y - NAIL_TIP_OFFSET;
+    }
+
     if (!attachedTube || !attachedTube.userData) return;
     // Keep plating visuals synced to reaction progress continuously
     if (enablePlating && plateOverlay) {
@@ -316,31 +471,6 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
       const opacity = platingUnlocked ? 1.0 : 0.0;
       updateOverlayUniform(plateOverlay, nail.userData.plateLocalY, opacity);
       updateSteelUniform(steelUniformAccessor, nail.userData.plateLocalY, opacity);
-    }
-    // (No gradient growth for plating)
-  // Drop physics when released inside tube
-    if (nail.userData.isInTube && isDropping) {
-      // lock to tube center on XZ
-      nail.position.x = attachedTube.position.x;
-      nail.position.z = attachedTube.position.z;
-      velY += GRAVITY * Math.max(0, dt);
-      nail.position.y = Math.max(NAIL_TIP_OFFSET, nail.position.y - velY * Math.max(0, dt));
-      // Update plating growth while dropping
-      if (enablePlating && plateOverlay) {
-        // Keep opacity in sync while dropping; plated height stays frozen
-        const opacity = platingUnlocked ? 1.0 : 0.0;
-        updateOverlayUniform(plateOverlay, nail.userData.plateLocalY, opacity);
-        updateSteelUniform(steelUniformAccessor, nail.userData.plateLocalY, opacity);
-      }
-      // Stop at bottom (tip at y=0)
-      if (Math.abs(nail.position.y - NAIL_TIP_OFFSET) < 1e-4) {
-        nail.position.y = NAIL_TIP_OFFSET;
-        isDropping = false;
-        velY = 0;
-      }
-      // update last positions
-      lastInsidePos.copy(nail.position);
-      lastTipY = nail.position.y - NAIL_TIP_OFFSET;
     }
     // If not started yet and we are immersed, start reaction from planned values
     const SURFACE_BAND = 0.02;
@@ -388,7 +518,10 @@ export function setupNaulaController({ renderer, camera, controls, nail, constan
     }
     const mats = attachedTube.userData.liquidMaterials || [];
     const col = react.start.clone().lerp(react.target, react.progress);
-    mats.forEach(m => { if (m && m.color) m.color.copy(col); });
+    mats.forEach(m => {
+      if (m && m.color) m.color.copy(col);
+      if (m && m.attenuationColor) m.attenuationColor.copy(col);
+    });
   }
 
   return { dispose, attachToTube, reset, tick };

@@ -35,7 +35,7 @@
         // --- Perusasetukset ---
         const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(3.5, 5.5, 12.5); // hieman kauempana
+    camera.position.set(3.5, 6.5, 15.5);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
@@ -44,7 +44,7 @@
         document.body.appendChild(renderer.domElement);
 
         const controls = new OrbitControls(camera, renderer.domElement);
-        controls.target.set(0, 2, 0);
+        controls.target.set(0, 3, 0);
     const selAnimator = createSelectionAnimator({ controls });
     const info = createInfoTextManager();
     const preloader = createPreloader();
@@ -85,73 +85,83 @@
         );
 
         // --- Vakiot ---
-        const TUBE_RADIUS = 0.8;
-        const TUBE_HEIGHT = 6.0;
-        const LIQUID_LEVEL = TUBE_HEIGHT * 0.6; // nesteen korkeus
-        const LIQUID_RADIUS = TUBE_RADIUS - 0.05;
+        const TUBE_RADIUS = 0.5;
+        const TUBE_HEIGHT = 4.0;
+        const WALL_THICKNESS = 0.05;
+        const LIQUID_LEVEL = TUBE_HEIGHT / 2;
+        const LIQUID_RADIUS = TUBE_RADIUS - WALL_THICKNESS;
+        const glassMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0xf7fdff,
+            metalness: 0,
+            roughness: 0.025,
+            ior: 1.52,
+            transmission: 0.98,
+            thickness: 0.08,
+            transparent: true,
+            opacity: 0.2,
+            clearcoat: 0.85,
+            clearcoatRoughness: 0.035,
+            envMapIntensity: 1.25,
+            attenuationColor: 0xe7f7ff,
+            attenuationDistance: 2,
+            depthWrite: false,
+            side: THREE.DoubleSide
+        });
+
+        function createTubeGeometry(radius, height) {
+            const cylinderHeight = height - radius;
+            const cylinder = new THREE.CylinderGeometry(radius, radius, cylinderHeight, 64, 1, true)
+                .translate(0, cylinderHeight / 2, 0);
+            const bottom = new THREE.SphereGeometry(radius, 64, 32, 0, Math.PI * 2, 0, Math.PI / 2)
+                .rotateX(Math.PI);
+            cylinder.deleteAttribute('uv');
+            bottom.deleteAttribute('uv');
+            const merged = BufferGeometryUtils.mergeGeometries([bottom, cylinder])
+                .translate(0, radius, 0);
+            const geometry = BufferGeometryUtils.mergeVertices(merged);
+            geometry.computeVertexNormals();
+            return geometry;
+        }
 
         // --- Koeputki (lasi) + liuos (väri parametrina) ---
         function createTestTubeWithSolution({ liquidColor = 0x2e6cff, enableWater = true, solution = 'CUSO4' } = {}) {
             const group = new THREE.Group();
-
-            // Lasi
-            const glassMaterial = new THREE.MeshPhysicalMaterial({
-                color: 0xffffff,
-                metalness: 0.1,
-                roughness: 0.05,
-                ior: 1.5,
-                transmission: 0.98,
-                transparent: true,
-                opacity: 0.3,
-                depthWrite: false,
-                side: THREE.DoubleSide
-            });
-            const cyl = new THREE.CylinderGeometry(TUBE_RADIUS, TUBE_RADIUS, TUBE_HEIGHT, 32, 1, true)
-                .translate(0, TUBE_HEIGHT / 2, 0);
-            const bowl = new THREE.SphereGeometry(TUBE_RADIUS, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2)
-                .rotateX(Math.PI);
-            const tubeGeom = BufferGeometryUtils.mergeGeometries([cyl, bowl]);
-            const glass = new THREE.Mesh(tubeGeom, glassMaterial);
+            const meniscusRise = 0.018;
+            const glass = new THREE.Mesh(createTubeGeometry(TUBE_RADIUS, TUBE_HEIGHT), glassMaterial.clone());
             group.add(glass);
             glass.userData.group = group;
+            const rimGeometry = new THREE.TorusGeometry(
+                TUBE_RADIUS - WALL_THICKNESS / 2,
+                WALL_THICKNESS / 2,
+                8,
+                48
+            ).rotateX(Math.PI / 2);
+            const glassRim = new THREE.Mesh(rimGeometry, glassMaterial.clone());
+            glassRim.position.y = TUBE_HEIGHT;
+            group.add(glassRim);
 
-            // Kuparisulfaattiliuos (sininen neste)
             const liquidMaterial = new THREE.MeshPhysicalMaterial({
                 color: liquidColor,
-                roughness: 0.2,
-                metalness: 0.0,
-                ior: 1.33,
-                transmission: 0.85,
+                roughness: 0.1,
+                transmission: 0.9,
                 transparent: true,
-                opacity: 0.9,
+                thickness: 0.2,
                 depthWrite: false,
                 side: THREE.DoubleSide
             });
-            const liquidGeom = new THREE.CylinderGeometry(LIQUID_RADIUS, LIQUID_RADIUS, LIQUID_LEVEL, 32, 1, true)
-                .translate(0, LIQUID_LEVEL / 2, 0);
-            const liquid = new THREE.Mesh(liquidGeom, liquidMaterial);
-            group.add(liquid);
-
-            // Alaosan neste hemisfäärinä (täyttää pyöristetyn pohjan)
-            const bottomLiquidGeom = new THREE.SphereGeometry(
-                LIQUID_RADIUS,
-                32,
-                16,
-                0,
-                Math.PI * 2,
-                0,
-                Math.PI / 2
-            )
-                .rotateX(Math.PI)
-                .translate(0, 0, 0);
-            const bottomLiquid = new THREE.Mesh(bottomLiquidGeom, liquidMaterial);
-            group.add(bottomLiquid);
+            const liquidBody = new THREE.Mesh(
+                createTubeGeometry(LIQUID_RADIUS, LIQUID_LEVEL + meniscusRise),
+                liquidMaterial
+            );
+            group.add(liquidBody);
 
             // --- Vesiefekti jannitesarja/index.html -tyyliin ---
             // Materiaalit
             const liquidSurfaceMat = new THREE.MeshPhysicalMaterial({
                 color: liquidColor,
-                roughness: 0.12,
+                roughness: 0.035,
+                clearcoat: 0.35,
+                clearcoatRoughness: 0.08,
                 transmission: 0.9,
                 transparent: true,
                 thickness: 0.2,
@@ -159,79 +169,102 @@
                 side: THREE.DoubleSide
             });
 
-            // Yhteiset uniformit pinnalle ja meniskille
+            // Pinnan aaltoilun ja meniskin yhteiset uniformit
             const waterUniforms = {
                 uTime: { value: 0 },
                 uDropTime: { value: -1000 },
-                uDropCenter: { value: new THREE.Vector2(0.5, 0.5) },
-                uDropStrength: { value: 1.0 }
+                uDropCenter: { value: new THREE.Vector2() },
+                uDropStrength: { value: 1.0 },
+                uRadius: { value: LIQUID_RADIUS }
             };
 
             // Vertex-funktio aaltoilulle (copy/align jannitesarja)
-            const waveVertexShader = `uniform float uTime; uniform float uDropTime; uniform vec2 uDropCenter; uniform float uDropStrength;
-                float getWaveHeight(vec2 uvPos) {
-                    float timeSinceDrop = uTime - uDropTime; if (timeSinceDrop < 0.0 || timeSinceDrop > 4.0) return 0.0;
-                    vec2 centeredUv = uvPos - uDropCenter; float dist = length(centeredUv) * 2.0; float totalWave = 0.0;
-                    float decay = pow(1.0 - (timeSinceDrop / 4.0), 2.0); float mainSpeed = 2.5, mainFreq = 15.0;
-                    float mainWaveFront = timeSinceDrop * mainSpeed;
-                    if (dist <= mainWaveFront + 0.2) {
-                        float amplitude = 0.07 * decay * uDropStrength; float wave = sin(dist * mainFreq - timeSinceDrop * mainSpeed * mainFreq);
-                        float pulse = smoothstep(mainWaveFront + 0.2, mainWaveFront - 0.3, dist); totalWave += wave * amplitude * pulse;
-                    } return totalWave;
+            const waveVertexShader = `uniform float uTime; uniform float uDropTime; uniform vec2 uDropCenter; uniform float uDropStrength; uniform float uRadius;
+                float getSurfaceHeight(vec2 p) {
+                    float radiusFromCenter = length(p) / uRadius;
+                    float edgeFade = 1.0 - smoothstep(0.84, 1.0, radiusFromCenter);
+                    float meniscus = 0.018 * smoothstep(0.72, 1.0, radiusFromCenter);
+                    float ambient = 0.0025 * sin(dot(p, vec2(8.0, 5.0)) - uTime * 1.1)
+                                  + 0.0018 * sin(dot(p, vec2(-4.0, 9.0)) - uTime * 0.8)
+                                  + 0.0012 * sin(dot(p, vec2(11.0, -6.0)) + uTime * 0.65);
+                    float t = uTime - uDropTime;
+                    float impact = 0.0;
+                    if (t > 0.0 && t < 3.5) {
+                        float dist = length(p - uDropCenter);
+                        float front = t * 0.48;
+                        float width = 0.08 + t * 0.035;
+                        float packet = exp(-pow((dist - front) / width, 2.0));
+                        float ripple = sin(34.0 * (dist - front));
+                        float tail = exp(-t * 0.8) * exp(-dist * 0.55);
+                        float crater = -0.02 * exp(-t * 7.0) * exp(-dist * dist * 80.0);
+                        impact = uDropStrength * (0.035 * packet * ripple * tail + crater);
+                    }
+                    return meniscus + edgeFade * (ambient + impact);
                 }\n`;
 
-            // Pinnan geometria (ympyrä), vaaka-asentoon ja nesteen pintakorkeuteen
-            const liquidSurfaceGeom = new THREE.CircleGeometry(LIQUID_RADIUS, 64)
-                .rotateX(-Math.PI / 2)
-                .translate(0, LIQUID_LEVEL, 0);
+            function createLiquidSurfaceGeometry(radius) {
+                const radialSegments = 64;
+                const radialRings = 24;
+                const positions = [0, 0, 0];
+                const indices = [];
+                for (let ring = 1; ring <= radialRings; ring++) {
+                    const r = radius * ring / radialRings;
+                    for (let segment = 0; segment < radialSegments; segment++) {
+                        const angle = segment / radialSegments * Math.PI * 2;
+                        positions.push(Math.cos(angle) * r, 0, Math.sin(angle) * r);
+                    }
+                }
+                for (let segment = 0; segment < radialSegments; segment++) {
+                    const next = (segment + 1) % radialSegments;
+                    indices.push(0, 1 + next, 1 + segment);
+                }
+                for (let ring = 1; ring < radialRings; ring++) {
+                    const innerStart = 1 + (ring - 1) * radialSegments;
+                    const outerStart = innerStart + radialSegments;
+                    for (let segment = 0; segment < radialSegments; segment++) {
+                        const next = (segment + 1) % radialSegments;
+                        const inner = innerStart + segment;
+                        const innerNext = innerStart + next;
+                        const outer = outerStart + segment;
+                        const outerNext = outerStart + next;
+                        indices.push(inner, innerNext, outer, outer, innerNext, outerNext);
+                    }
+                }
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                geometry.setIndex(indices);
+                geometry.computeVertexNormals();
+                geometry.translate(0, LIQUID_LEVEL, 0);
+                return geometry;
+            }
+
+            const liquidSurfaceGeom = createLiquidSurfaceGeometry(LIQUID_RADIUS);
             liquidSurfaceMat.onBeforeCompile = (shader) => {
                 Object.assign(shader.uniforms, waterUniforms);
                 shader.vertexShader = waveVertexShader + shader.vertexShader;
                 shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `
                     #include <begin_vertex>
-                    transformed.y += getWaveHeight(uv);
+                    transformed.y += getSurfaceHeight(position.xz);
                 `);
                 shader.vertexShader = shader.vertexShader.replace('#include <beginnormal_vertex>', `
                     #include <beginnormal_vertex>
-                    float gridStep = 0.015; float hU = getWaveHeight(uv+vec2(gridStep,0.0)); float hD = getWaveHeight(uv-vec2(gridStep,0.0));
-                    float hL = getWaveHeight(uv+vec2(0.0,gridStep)); float hR = getWaveHeight(uv-vec2(0.0,gridStep));
-                    objectNormal = normalize(vec3(hD-hU, gridStep*2.0, hR-hL));
+                    float gridStep = 0.006;
+                    float hL = getSurfaceHeight(position.xz - vec2(gridStep, 0.0));
+                    float hR = getSurfaceHeight(position.xz + vec2(gridStep, 0.0));
+                    float hD = getSurfaceHeight(position.xz - vec2(0.0, gridStep));
+                    float hU = getSurfaceHeight(position.xz + vec2(0.0, gridStep));
+                    objectNormal = normalize(vec3(-(hR-hL)/(2.0*gridStep), 1.0, -(hU-hD)/(2.0*gridStep)));
                 `);
             };
             const liquidSurface = new THREE.Mesh(liquidSurfaceGeom, liquidSurfaceMat);
 
-            // Meniski renkaana
-            const meniscusHeight = 0.08;
-            const meniscusPoints = [
-                new THREE.Vector2(LIQUID_RADIUS, -meniscusHeight * 0.5),
-                new THREE.Vector2(LIQUID_RADIUS - meniscusHeight * 0.5, 0),
-                new THREE.Vector2(LIQUID_RADIUS, meniscusHeight * 0.5)
-            ];
-            const meniscusGeom = new THREE.LatheGeometry(meniscusPoints, 64)
-                .translate(0, LIQUID_LEVEL - (meniscusHeight * 0.5), 0);
-            const meniscusMat = liquidSurfaceMat.clone();
-            meniscusMat.onBeforeCompile = (shader) => {
-                Object.assign(shader.uniforms, waterUniforms);
-                shader.vertexShader = waveVertexShader + shader.vertexShader;
-                shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `
-                    #include <begin_vertex>
-                    vec2 circUv = vec2((position.x/${LIQUID_RADIUS.toFixed(4)})*0.5+0.5,(position.z/${LIQUID_RADIUS.toFixed(4)})*0.5+0.5);
-                    float waveH = getWaveHeight(circUv);
-                    float strength = smoothstep(-${(meniscusHeight*0.5).toFixed(4)},${(meniscusHeight*0.5).toFixed(4)},position.y);
-                    transformed.y += waveH * strength;
-                `);
-            };
-            const meniscus = new THREE.Mesh(meniscusGeom, meniscusMat);
-
-            // Render-järjestys: pohja -> neste -> pinta -> meniski -> lasi
-            bottomLiquid.renderOrder = 1;
-            liquid.renderOrder = 2;
-            liquidSurface.renderOrder = 3;
-            meniscus.renderOrder = 4;
+            liquidBody.renderOrder = 1;
+            liquidSurface.renderOrder = 2;
             glass.renderOrder = 5;
+            glassRim.renderOrder = 5.1;
 
             if (enableWater) {
-                group.add(liquidSurface, meniscus);
+                group.add(liquidSurface);
                 group.userData.waterUniforms = waterUniforms;
             }
             group.userData.solution = solution;
@@ -239,14 +272,12 @@
             // Tallenna nesteen materiaalit ja perusväri reaktioita varten
             const baseColor = new THREE.Color(liquidColor);
             group.userData.baseColor = baseColor.clone();
-            group.userData.liquidMaterials = [liquidMaterial, liquidSurfaceMat, meniscusMat];
+            group.userData.liquidMaterials = [liquidMaterial, liquidSurfaceMat];
             // Reaktion tila alustuksena (aktivoituu naulan kiinnityksestä)
             group.userData.reaction = { active: false, progress: 0, start: baseColor.clone(), target: null, speed: 0 };
 
             return group;
         }
-
-                        // Vesiefekti poistettu kokonaan
 
         // --- Objektit ---
     // Luo 3 koeputkea: CuSO4 (sininen, aaltoilu), AgNO3 (kirkas), FeSO4 (ruskehtava pyynnön mukaan)
@@ -270,7 +301,7 @@
     nail.userData.nailType = 'steel';
         scene.add(nail);
 
-        // Kuparinaula (voi kiinnittää putkeen ja raahata ylös/alas, ilman kuparointia)
+        // Kuparinaula (raahattavissa koeputkien välissä)
     const copperNail = createNaulaCopper();
     const COPPER_START_POS = new THREE.Vector3(-4.5, 3.4, 0);
     copperNail.position.copy(COPPER_START_POS); // kauempana koeputkista
@@ -293,8 +324,8 @@
         // Koeputket
         function addTubeLabel(group, text) {
             const label = createTextSprite(text, { worldHeight: 0.5 });
-            // Place above the tube rim
-            label.position.set(0, TUBE_HEIGHT + 0.6, 0);
+            // Place below the rounded tube base
+            label.position.set(0, -0.6, 0);
             group.add(label);
         }
         // Show only chemical formulas with correct subscripts
@@ -303,7 +334,9 @@
         addTubeLabel(testTubeAg, 'AgNO₃');
         // Helper: return nail home by going up first, then over, then down
         async function returnNailHome(nailMesh, startVec3) {
-            const upY = Math.max(nailMesh.position.y, TUBE_HEIGHT + 1.2);
+            if (!nailMesh.geometry.boundingBox) nailMesh.geometry.computeBoundingBox();
+            const tipOffset = -nailMesh.geometry.boundingBox.min.y;
+            const upY = Math.max(nailMesh.position.y, TUBE_HEIGHT + tipOffset + 0.2);
             const p1 = new THREE.Vector3(nailMesh.position.x, upY, nailMesh.position.z);
             await selAnimator.animateMoveTo(nailMesh, p1, { duration: 350 });
             const p2 = new THREE.Vector3(startVec3.x, upY, startVec3.z);
@@ -316,6 +349,7 @@
             controls,
             nail: copperNail,
             constants: { TUBE_RADIUS, TUBE_HEIGHT, LIQUID_LEVEL },
+            tubeGroups: [testTubeCu, testTubeAg, testTubeFe],
             enablePlating: true,
             onAttached: (nailType, solution) => {
                 info.show('Raahaa kuparinaula liuokseen.', { duration: 2500 });
@@ -325,8 +359,6 @@
                     info.show('Kuparinaula pinnoittui hopealla. Reaktio: Cu + 2 Ag<sup>+</sup> → Cu<sup>2+</sup> + 2 Ag.', { duration: 4200 });
                 }
                 // Palauta kuparinaula lähtöpisteeseen ja estä jatkotoimet
-                lowerNail(copperNail);
-                selectedNail = null;
                 returnNailHome(copperNail, COPPER_START_POS.clone());
             }
         });
@@ -342,6 +374,7 @@
             controls,
             nail,
             constants: { TUBE_RADIUS, TUBE_HEIGHT, LIQUID_LEVEL },
+            tubeGroups: [testTubeCu, testTubeAg, testTubeFe],
             enablePlating: true,
             onAttached: (nailType, solution) => {
                 info.show('Raahaa rautanaula liuokseen.', { duration: 2500 });
@@ -353,8 +386,6 @@
                     info.show('Rautanaula pinnoittui hopealla. Reaktio: Fe + 2 Ag<sup>+</sup> → Fe<sup>2+</sup> + 2 Ag.', { duration: 5200 });
                 }
                 // Palauta rautanaula lähtöpisteeseen ja estä jatkotoimet
-                lowerNail(nail);
-                selectedNail = null;
                 returnNailHome(nail, START_POS.clone());
             }
         });
@@ -402,102 +433,12 @@
         // Odotetaan käyttäjän käynnistystä
         preloader.onStart(() => {
             preloader.hide();
-            info.setSticky('Klikkaa ensin naulaa ja valitse sitten koeputki.');
+            info.setSticky('Nosta naula reunan yläpuolelle, siirrä aukon kohdalle ja pudota.');
             animate();
         });
         
-        // Klikkivalinta: ensin valitse naula, sitten valitse koeputki -> kiinnitys
-        const clickableTubes = [
-            testTubeCu.children.find(o => o.userData && o.userData.group),
-            testTubeAg.children.find(o => o.userData && o.userData.group),
-            testTubeFe.children.find(o => o.userData && o.userData.group),
-        ].filter(Boolean);
-
-        const raycaster = new THREE.Raycaster();
-        let selectedNail = null;
-
-        function raiseNail(mesh) {
-            if (!mesh) return;
-            if (!mesh.userData.isRaised) {
-                mesh.userData.selBaseY = mesh.position.y;
-                // pieni nosto valinnan merkiksi (animoituna)
-                selAnimator.animateSelect(mesh, { lift: 0.25, duration: 220 });
-                mesh.userData.isRaised = true;
-            }
-        }
-
-        function lowerNail(mesh) {
-            if (!mesh) return;
-            if (mesh.userData.isRaised) {
-                // jos ei ole kiinnitetty putkeen, palauta peruskorkeus
-                if (!mesh.userData.isInTube && typeof mesh.userData.selBaseY === 'number') {
-                    const target = new THREE.Vector3(mesh.position.x, mesh.userData.selBaseY, mesh.position.z);
-                    selAnimator.animateMoveTo(mesh, target, { duration: 180 });
-                }
-                mesh.userData.isRaised = false;
-                mesh.userData.selBaseY = undefined;
-            }
-        }
-        window.addEventListener('click', (event) => {
-            const mouse = new THREE.Vector2((event.clientX / window.innerWidth) * 2 - 1, -(event.clientY / window.innerHeight) * 2 + 1);
-            raycaster.setFromCamera(mouse, camera);
-
-            // 1) yritä osua naulaan
-            const nailHits = raycaster.intersectObjects([nail, copperNail], false).filter(h => !(h.object.userData && h.object.userData.completed));
-            if (nailHits.length > 0) {
-                // jos vaihtuu valinta, laske edellinen
-                if (selectedNail && selectedNail !== nailHits[0].object) {
-                    lowerNail(selectedNail);
-                }
-                selectedNail = nailHits[0].object;
-                raiseNail(selectedNail);
-                if (selectedNail.userData && selectedNail.userData.nailType === 'copper') {
-                    info.show('Kuparinaula valittu. Klikkaa koeputkea.', { duration: 2600 });
-                } else {
-                    info.show('Rautanaula valittu. Klikkaa koeputkea.', { duration: 2600 });
-                }
-                return;
-            }
-
-            // 2) jos naula valittu, yritä osua koeputkeen
-            const tubeHits = raycaster.intersectObjects(clickableTubes, false);
-            if (tubeHits.length > 0 && selectedNail && selectedNail.userData && selectedNail.userData.controller) {
-                const glassMesh = tubeHits[0].object;
-                const group = glassMesh.userData.group;
-                // Animoidaan siirtyminen koeputken yläpuolelle ja kiinnitetään vasta lopuksi
-                // Lasketaan kärjen offset ja kohdekorkeus kannen yläpuolella
-                const nailToAttach = selectedNail;
-                if (!nailToAttach.geometry.boundingBox) nailToAttach.geometry.computeBoundingBox();
-                const bbox = nailToAttach.geometry.boundingBox;
-                const tipOffset = -bbox.min.y; // kärjen etäisyys origosta
-                const yAboveRim = TUBE_HEIGHT + tipOffset + 0.2;
-                const target = new THREE.Vector3(group.position.x, yAboveRim, group.position.z);
-                // Poista aloitusteksti
-                info.clear();
-                selAnimator.animateMoveTo(nailToAttach, target, { duration: 600 }).then(() => {
-                    // Varmista, että edelleen valittuna ja olemassa
-                    if (nailToAttach && nailToAttach.userData && nailToAttach.userData.controller) {
-                        nailToAttach.userData.controller.attachToTube(group);
-                    }
-                });
-                // poistetaan valintamerkintä heti, ettei laskeudu välissä
-                nailToAttach.userData.isRaised = false;
-                nailToAttach.userData.selBaseY = undefined;
-                selectedNail = null;
-                return;
-            }
-
-            // ei osumia -> nollaa valinta
-            lowerNail(selectedNail);
-            selectedNail = null;
-        });
-
         // "Aloita alusta" -nappi: nollaa naulojen sijainnit, kiinnitykset ja päällystykset sekä veden pudotusuniformit
         document.getElementById('resetBtn').addEventListener('click', () => {
-            // Nollaa valinta
-            lowerNail(selectedNail);
-            selectedNail = null;
-
             // Nollaa naulat (paikat, kiinnitykset, päällystys)
             if (nail.userData.controller && nail.userData.controller.reset) {
                 nail.userData.controller.reset(START_POS);
@@ -520,7 +461,10 @@
                 // Palauta liuoksen väri perusväriin ja nollaa reaktio
                 if (g.userData && g.userData.liquidMaterials && g.userData.baseColor) {
                     const c = g.userData.baseColor;
-                    g.userData.liquidMaterials.forEach(m => m.color.copy(c));
+                    g.userData.liquidMaterials.forEach(m => {
+                        m.color.copy(c);
+                        if (m.attenuationColor) m.attenuationColor.copy(c);
+                    });
                 }
                 if (g.userData && g.userData.reaction) {
                     g.userData.reaction.active = false;
